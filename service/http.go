@@ -91,6 +91,21 @@ func (p *httpProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	// 正规代理应收到绝对形式（GET http://host/path），但代理链/透明转发
+	// 可能只给 origin-form（GET /path 加上 Host 头）。此时 URL 没有
+	// scheme 与 host，直接交给 Transport 会报
+	// `Get "/path": unsupported protocol scheme ""`。
+	// 按 HTTP/1.1 语义用 Host 头补全；明文请求的 scheme 恒为 http
+	// （https 一定走 CONNECT）。
+	if req.URL.Scheme == "" || req.URL.Host == "" {
+		if req.Host == "" {
+			http.Error(w, "cannot determine target host: request has neither absolute URL nor Host header", http.StatusBadRequest)
+			return
+		}
+		req.URL.Scheme = "http"
+		req.URL.Host = req.Host
+	}
+
 	log.DebugPrintf("HTTP proxy request: %s %s", req.Method, req.URL.String())
 	req.RequestURI = ""
 

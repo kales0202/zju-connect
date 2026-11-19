@@ -127,3 +127,53 @@ func TestHTTPConnectClosesTargetWhenClientDisconnects(t *testing.T) {
 		t.Fatal("target connection was not closed after proxy client disconnected")
 	}
 }
+
+// 代理收到 origin-form（只有 path，没有 scheme/host）时，必须用 Host 头
+// 补全目标地址，而不是把相对 URL 交给 Transport。
+// 复现自 dae 走 HTTP 代理的场景：不修会得到
+// `Get "/demo/": unsupported protocol scheme ""`。
+func TestHTTPProxyOriginFormUsesHostHeader(t *testing.T) {
+	proxy := newHTTPProxy(dial.NewDialer(nil, nil, nil, false, ""))
+
+	var gotURL string
+	proxy.client.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		gotURL = req.URL.String()
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(bytes.NewBufferString("ok")),
+		}, nil
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/demo/", nil)
+	req.Host = "192.0.2.10:8080"
+
+	rec := httptest.NewRecorder()
+	proxy.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %q", rec.Code, rec.Body.String())
+	}
+	if gotURL != "http://192.0.2.10:8080/demo/" {
+		t.Fatalf("upstream URL = %q, want http://192.0.2.10:8080/demo/", gotURL)
+	}
+}
+
+// 缺少 Host 头时必须明确拒绝，而不是拼出一个无意义的 URL。
+func TestHTTPProxyOriginFormWithoutHost(t *testing.T) {
+	proxy := newHTTPProxy(dial.NewDialer(nil, nil, nil, false, ""))
+	proxy.client.Transport = roundTripFunc(func(*http.Request) (*http.Response, error) {
+		t.Fatal("upstream must not be called without a host")
+		return nil, nil
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/demo/", nil)
+	req.Host = ""
+
+	rec := httptest.NewRecorder()
+	proxy.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+}
