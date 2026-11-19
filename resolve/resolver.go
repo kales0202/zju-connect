@@ -32,6 +32,13 @@ type Resolver struct {
 
 	timer  *time.Timer
 	useTCP bool
+
+	// 远端 DNS 连续失败后临时跳过。
+	// 若配置的远端 DNS 在目标环境不可达，每个新连接都会先白等一次解析超时
+	// 才回落到 secondary，表现为「每次都慢十几秒」。
+	skipRemoteDNSLock  sync.RWMutex
+	skipRemoteDNS      bool
+	skipRemoteDNSTimer *time.Timer
 	// check to use tcp resolver or udp resolver
 	tcpLock           sync.RWMutex
 	resolutionMu      sync.Mutex
@@ -42,7 +49,16 @@ type Resolver struct {
 	closeOnce sync.Once
 }
 
-const remoteDNSTCPFallbackDelay = 300 * time.Millisecond
+const (
+	remoteDNSTCPFallbackDelay = 300 * time.Millisecond
+	// remoteDNSSkipDuration 是远端 DNS 不可用时跳过它的时长。
+	// 与 TCP 偏好的 10 分钟保持一致：到期后自动再给远端一次机会。
+	remoteDNSSkipDuration = 10 * time.Minute
+	// remoteDNSTimeout 限制单次远端 DNS 查询。
+	// 远端不可达时，Go 解析器自身的重试会把一次解析拖到十几秒；
+	// 而 secondary 通常几十毫秒就能答，所以这里及早放弃远端。
+	remoteDNSTimeout = 3 * time.Second
+)
 
 type lookupIPFunc func(context.Context, string, string) ([]net.IP, error)
 
@@ -139,7 +155,7 @@ func (r *Resolver) Resolve(ctx context.Context, host string) (resCtx context.Con
 		}
 	}
 
-	if r.useRemoteDNS {
+	if r.useRemoteDNS && !r.remoteDNSDisabled() {
 		ip, err := r.resolveCoordinated(ctx, host, func(lookupCtx context.Context) (net.IP, error) {
 			return r.resolveRemote(lookupCtx, host)
 		})
@@ -147,13 +163,60 @@ func (r *Resolver) Resolve(ctx context.Context, host string) (resCtx context.Con
 			if ctx.Err() != nil {
 				return ctx, nil, ctx.Err()
 			}
+			// 只有「连不通」才值得临时跳过；域名不存在（NXDOMAIN）
+			// 是远端 DNS 的正常回答，不能据此判定远端不可用。
+			if isDNSTransportError(err) {
+				r.disableRemoteDNSTemporarily()
+			}
 			log.Printf("Resolve IPv4 addr failed using remote DNS: %s, using secondary DNS instead", host)
 			return r.ResolveWithSecondaryDNS(ctx, host)
 		}
 		log.Printf("%s -> %s", host, ip.String())
 		return ctx, ip, nil
-	} else {
-		return r.ResolveWithSecondaryDNS(ctx, host)
+	}
+
+	if r.useRemoteDNS {
+		log.DebugPrintf("Skip remote DNS for %s: recent failure, use secondary DNS", host)
+	}
+	return r.ResolveWithSecondaryDNS(ctx, host)
+}
+
+// isDNSTransportError 判断是否是「远端 DNS 不可用」而非「域名不存在」。
+func isDNSTransportError(err error) bool {
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return !dnsErr.IsNotFound
+	}
+	return err != nil
+}
+
+func (r *Resolver) remoteDNSDisabled() bool {
+	r.skipRemoteDNSLock.RLock()
+	defer r.skipRemoteDNSLock.RUnlock()
+	return r.skipRemoteDNS
+}
+
+// disableRemoteDNSTemporarily 在远端 DNS 不可用时，接下来一段时间直接走 secondary。
+// 参照同一文件里 preferTCPTemporarily 的做法：到期后自动恢复，再给远端一次机会。
+func (r *Resolver) disableRemoteDNSTemporarily() {
+	r.skipRemoteDNSLock.Lock()
+	defer r.skipRemoteDNSLock.Unlock()
+
+	if r.skipRemoteDNS {
+		return
+	}
+
+	r.skipRemoteDNS = true
+	log.Printf("Remote DNS is unreachable, use secondary DNS for the next %s", remoteDNSSkipDuration)
+
+	if r.skipRemoteDNSTimer == nil {
+		r.skipRemoteDNSTimer = time.AfterFunc(remoteDNSSkipDuration, func() {
+			r.skipRemoteDNSLock.Lock()
+			r.skipRemoteDNS = false
+			r.skipRemoteDNSTimer = nil
+			r.skipRemoteDNSLock.Unlock()
+			log.Printf("Remote DNS retry window reopened")
+		})
 	}
 }
 
@@ -215,6 +278,11 @@ func matchDomainResource(index *domainResourceIndex, host string) (string, []cli
 }
 
 func (r *Resolver) resolveRemote(ctx context.Context, host string) (net.IP, error) {
+	// 远端 DNS 是「可能不可用」的路径，给它一个上限，
+	// 避免一次解析把上层请求拖到十几秒。
+	ctx, cancel := context.WithTimeout(ctx, remoteDNSTimeout)
+	defer cancel()
+
 	r.tcpLock.RLock()
 	useTCP := r.useTCP
 	r.tcpLock.RUnlock()
@@ -343,20 +411,22 @@ func (r *Resolver) RemoteTCPResolver() (*net.Resolver, error) {
 }
 
 func (r *Resolver) ResolveWithSecondaryDNS(ctx context.Context, host string) (context.Context, net.IP, error) {
-	if targets, err := r.secondaryResolver.LookupIP(ctx, "ip4", host); err != nil {
+	targets, err := r.secondaryResolver.LookupIP(ctx, "ip4", host)
+	if err != nil {
 		log.Printf("Resolve IPv4 addr failed using secondary DNS: %s. Try IPv6 addr", host)
 
-		if targets, err = r.secondaryResolver.LookupIP(ctx, "ip6", host); err != nil {
+		targets, err = r.secondaryResolver.LookupIP(ctx, "ip6", host)
+		if err != nil {
 			log.Printf("Resolve IPv6 addr failed using secondary DNS: %s", host)
 			return ctx, nil, err
-		} else {
-			log.Printf("%s -> %s", host, targets[0].String())
-			return ctx, targets[0], nil
 		}
-	} else {
-		log.Printf("%s -> %s", host, targets[0].String())
-		return ctx, targets[0], nil
 	}
+
+	log.Printf("%s -> %s", host, targets[0].String())
+	// 写入缓存：否则每个新连接都会先白试一次远端 DNS 再回落，
+	// 远端 DNS 不通时每次连接都要多等一个解析超时。
+	r.setDNSCache(host, targets[0])
+	return ctx, targets[0], nil
 }
 
 func (r *Resolver) Close() {
@@ -374,6 +444,13 @@ func (r *Resolver) Close() {
 			r.timer = nil
 		}
 		r.tcpLock.Unlock()
+
+		r.skipRemoteDNSLock.Lock()
+		if r.skipRemoteDNSTimer != nil {
+			r.skipRemoteDNSTimer.Stop()
+			r.skipRemoteDNSTimer = nil
+		}
+		r.skipRemoteDNSLock.Unlock()
 	})
 }
 

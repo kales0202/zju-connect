@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -355,5 +356,180 @@ func failingNetResolver() *net.Resolver {
 		Dial: func(context.Context, string, string) (net.Conn, error) {
 			return nil, errors.New("DNS unavailable")
 		},
+	}
+}
+
+// fakeDNSServer 起一个只回答 A 记录的极简 UDP DNS 服务，
+// 便于在不依赖真实网络的前提下验证解析与缓存行为。
+func fakeDNSServer(t *testing.T, answer net.IP) (addr string, queries *atomic.Int32, stop func()) {
+	t.Helper()
+
+	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen udp: %v", err)
+	}
+
+	queries = &atomic.Int32{}
+	done := make(chan struct{})
+
+	go func() {
+		buf := make([]byte, 512)
+		for {
+			n, peer, err := conn.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			if n < 12 {
+				continue
+			}
+			queries.Add(1)
+
+			// 跳过 question 的名字部分，定位到 qtype/qclass
+			off := 12
+			for off < n {
+				l := int(buf[off])
+				if l == 0 {
+					off++
+					break
+				}
+				off += 1 + l
+			}
+			questionEnd := off + 4
+			if questionEnd > n {
+				continue
+			}
+
+			resp := make([]byte, 0, questionEnd+16)
+			resp = append(resp, buf[0], buf[1])         // 复用查询 ID
+			resp = append(resp, 0x81, 0x80)             // QR=1 RD=1 RA=1
+			resp = append(resp, 0x00, 0x01)             // QDCOUNT
+			resp = append(resp, 0x00, 0x01)             // ANCOUNT
+			resp = append(resp, 0x00, 0x00, 0x00, 0x00) // NSCOUNT/ARCOUNT
+			resp = append(resp, buf[12:questionEnd]...) // question
+			resp = append(resp, 0xc0, 0x0c)             // 名字指针
+			resp = append(resp, 0x00, 0x01, 0x00, 0x01) // TYPE A / CLASS IN
+			resp = append(resp, 0x00, 0x00, 0x00, 0x3c) // TTL 60
+			resp = append(resp, 0x00, 0x04)             // RDLENGTH
+			resp = append(resp, answer.To4()...)
+
+			_, _ = conn.WriteTo(resp, peer)
+		}
+	}()
+
+	return conn.LocalAddr().String(), queries, func() {
+		select {
+		case <-done:
+		default:
+			close(done)
+		}
+		_ = conn.Close()
+	}
+}
+
+// secondaryOnlyResolver 构造一个「远端 DNS 必然失败、secondary 指向假 DNS」的解析器。
+func secondaryOnlyResolver(t *testing.T, remote *net.Resolver) (*Resolver, *atomic.Int32) {
+	t.Helper()
+
+	addr, q, stop := fakeDNSServer(t, net.ParseIP("192.0.2.55"))
+	t.Cleanup(stop)
+
+	secondary := &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "udp", addr)
+		},
+	}
+
+	return &Resolver{
+		remoteUDPResolver: remote,
+		remoteTCPResolver: remote,
+		secondaryResolver: secondary,
+		dnsCache:          cache.New(time.Minute, 0),
+		useRemoteDNS:      true,
+	}, q
+}
+
+// 回落得到的地址必须进缓存：否则每个新连接都会先白等一次远端 DNS 超时。
+func TestResolverCachesSecondaryDNSResult(t *testing.T) {
+	remote := net.Resolver{
+		PreferGo: true,
+		Dial: func(context.Context, string, string) (net.Conn, error) {
+			return nil, errors.New("remote dns unreachable")
+		},
+	}
+
+	resolver, queries := secondaryOnlyResolver(t, &remote)
+
+	_, first, err := resolver.Resolve(context.Background(), "internal.example")
+	if err != nil {
+		t.Fatalf("first Resolve() error = %v", err)
+	}
+	if !first.Equal(net.ParseIP("192.0.2.55")) {
+		t.Fatalf("first Resolve() = %s, want 192.0.2.55", first)
+	}
+	if !resolver.remoteDNSDisabled() {
+		t.Fatal("远端 DNS 连不通后应临时跳过它")
+	}
+
+	before := queries.Load()
+	_, second, err := resolver.Resolve(context.Background(), "internal.example")
+	if err != nil {
+		t.Fatalf("second Resolve() error = %v", err)
+	}
+	if !second.Equal(first) {
+		t.Fatalf("second Resolve() = %s, want %s", second, first)
+	}
+	if got := queries.Load(); got != before {
+		t.Fatalf("第二次解析又查了 DNS（%d 次，之前 %d 次），说明回落结果没有被缓存", got, before)
+	}
+}
+
+// 远端 DNS 失败后，解析其它域名时不应再尝试远端，避免每次多等一个超时。
+func TestResolverSkipsRemoteDNSAfterFailure(t *testing.T) {
+	var remoteCalls atomic.Int32
+
+	remote := net.Resolver{
+		PreferGo: true,
+		Dial: func(context.Context, string, string) (net.Conn, error) {
+			remoteCalls.Add(1)
+			return nil, errors.New("remote dns unreachable")
+		},
+	}
+
+	resolver, _ := secondaryOnlyResolver(t, &remote)
+
+	if _, _, err := resolver.Resolve(context.Background(), "first.example"); err != nil {
+		t.Fatalf("Resolve(first.example) error = %v", err)
+	}
+	before := remoteCalls.Load()
+	if before == 0 {
+		t.Fatal("首次解析应当尝试过远端 DNS")
+	}
+
+	if _, ip, err := resolver.Resolve(context.Background(), "second.example"); err != nil {
+		t.Fatalf("Resolve(second.example) error = %v", err)
+	} else if !ip.Equal(net.ParseIP("192.0.2.55")) {
+		t.Fatalf("Resolve(second.example) = %s, want 192.0.2.55", ip)
+	}
+
+	if after := remoteCalls.Load(); after != before {
+		t.Fatalf("远端 DNS 已被判定不可用，却又被调用了 %d 次", after-before)
+	}
+}
+
+// 域名不存在是远端 DNS 的正常回答，不能据此判定远端不可用。
+func TestIsDNSTransportError(t *testing.T) {
+	if isDNSTransportError(&net.DNSError{Err: "no such host", Name: "x.example", IsNotFound: true}) {
+		t.Fatal("NXDOMAIN 不应被当作远端 DNS 不可用")
+	}
+	if !isDNSTransportError(&net.DNSError{Err: "timeout", Name: "x.example", IsTimeout: true}) {
+		t.Fatal("超时应被当作远端 DNS 不可用")
+	}
+	if !isDNSTransportError(errors.New("dial failed")) {
+		t.Fatal("非 DNS 错误应被当作远端 DNS 不可用")
+	}
+	if isDNSTransportError(nil) {
+		t.Fatal("nil 不应被当作远端 DNS 不可用")
 	}
 }
