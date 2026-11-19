@@ -198,6 +198,15 @@ func (s *Session) performAntiMITMRequestContext(ctx context.Context, data antiMI
 	req.Header.Set("x-csrf-token", csrfToken)
 	req.Header.Set("x-sdp-rid", s.rid)
 	req.Header.Set("x-sdp-traceid", s.randSdpId())
+	// 该接口同样受服务端「接口签名校验」保护，缺这个头会被
+	// 直接拒绝（code 10000008, message "interface sig verify failed"）。
+	// 签名材料与 reportEnv 一致：path?query + body。
+	signKey := s.signKey
+	if len(signKey) == 0 {
+		signKey = sangforSignatureKey(data)
+	}
+	req.Header.Set("X-Request-Sig", sangforHMAC(signKey,
+		append([]byte("/controller/v1/public/antiMITMRequest?"+params.Encode()), payload...)))
 
 	resp, err := s.request(req)
 	if err != nil {
@@ -220,17 +229,25 @@ func (s *Session) performAntiMITMRequestContext(ctx context.Context, data antiMI
 			AntiMITMEnable int    `json:"antiMITMEnable"`
 		} `json:"data"`
 	}
+	log.DebugPrintf("anti-MITM request response: %s", string(body))
+
 	if err := json.Unmarshal(body, &result); err != nil {
 		return fmt.Errorf("aTrust anti-MITM request failed: invalid response: %w", err)
 	}
+	// 先看服务端错误码，再看 nonce。
+	// 反过来的话，服务端返回的任何失败都会先撞上 nonce 不匹配，
+	// 把真实原因（例如签名校验失败）掩盖掉。
+	switch result.Code {
+	case 0:
+	case 10000004:
+		return fmt.Errorf("aTrust anti-MITM request denied: session not found")
+	case 10000008:
+		return fmt.Errorf("aTrust anti-MITM request rejected: %s", result.Message)
+	default:
+		return fmt.Errorf("aTrust anti-MITM request failed with code %d: %s", result.Code, result.Message)
+	}
 	if result.Data.Nonce != nonce {
 		return fmt.Errorf("aTrust anti-MITM request nonce mismatch")
-	}
-	if result.Code == 10000004 {
-		return fmt.Errorf("aTrust anti-MITM request denied: session not found")
-	}
-	if result.Code == 10000008 {
-		return fmt.Errorf("aTrust anti-MITM request detected a MITM attack")
 	}
 
 	expected := sangforHMAC(sangforSignatureKey(data), body)
