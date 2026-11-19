@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os/exec"
 	"runtime"
+	"strconv"
 	"time"
 )
 
@@ -116,6 +117,21 @@ const captchaPageHTML = `<!DOCTYPE html>
   <div class="success" id="success">提交成功，可以关闭此页面</div>
 </div>
 <script>
+var pageNonce = new URLSearchParams(location.search).get('n') || '';
+var AUTO_CLOSE_MS = 3000;
+// 提交成功后自动关闭标签页。标签页由 xdg-open 打开，不是脚本 window.open
+// 打开的，部分浏览器会拒绝脚本关闭它；失败时退化为清屏，至少不把
+// 验证码/成功态留在屏幕上。
+function autoCloseTab() {
+  setTimeout(function () {
+    try { window.open('', '_self', ''); window.close(); } catch (e) {}
+    setTimeout(function () {
+      document.body.innerHTML =
+        '<div style="font-family:sans-serif;color:#999;text-align:center;padding:48px">已提交，本页可以关闭</div>';
+    }, 400);
+  }, AUTO_CLOSE_MS);
+}
+
 var clicks = [];
 var imgWrap = document.getElementById('imgWrap');
 var captchaImg = document.getElementById('captchaImg');
@@ -141,6 +157,7 @@ var I18N = {
     submit: '提 交', submitting: '提交中...',
     success: '提交成功，可以关闭此页面',
     submitFailed: '提交失败，请重试',
+    stalePage: '本页验证码已过期，请在新打开的页面重新操作',
     networkError: '网络错误，请重试',
     imgAlt: '验证码',
     debugSummary: '调试信息'
@@ -154,6 +171,7 @@ var I18N = {
     submit: 'Submit', submitting: 'Submitting...',
     success: 'Submitted. You may close this page.',
     submitFailed: 'Submission failed. Please retry.',
+    stalePage: 'This captcha has expired. Use the newly opened page.',
     networkError: 'Network error. Please retry.',
     imgAlt: 'Captcha',
     debugSummary: 'Debug'
@@ -276,6 +294,12 @@ function submitClicks() {
       submitBtn.style.display = 'none';
       debugPanelEl.style.display = 'none';
       successEl.style.display = 'block';
+      autoCloseTab();
+    } else if (xhr.status === 409) {
+      // 验证码已换新：旧页面作废，提示去看新开的标签页
+      isSubmitting = false;
+      renderStatus();
+      alert(tr('stalePage'));
     } else {
       isSubmitting = false;
       renderStatus();
@@ -287,7 +311,9 @@ function submitClicks() {
     renderStatus();
     alert(tr('networkError'));
   };
-  xhr.send('code=' + encodeURIComponent(payload));
+  // 带上本轮 nonce：验证码答错后上游会换一张新图并重启服务，
+  // 旧标签页若继续提交必须被拒绝，否则会把上一轮的坐标喂给新一轮。
+  xhr.send('code=' + encodeURIComponent(payload) + '&n=' + encodeURIComponent(pageNonce));
   return false;
 }
 
@@ -296,11 +322,29 @@ applyLang();
 </body>
 </html>`
 
-// serveCaptchaInBrowser starts a temporary HTTP server to display the captcha
-// image in the user's browser and waits for the user to click on character
-// positions and submit the coordinates.
-func serveCaptchaInBrowser(imgData []byte, timeout time.Duration, output io.Writer) (ClickCaptchaResponse, error) {
+// captchaServer 是一个临时 HTTP 服务：渲染点击式验证码页面并回收坐标。
+type captchaServer struct {
+	srv      *http.Server
+	listener net.Listener
+	resultCh chan ClickCaptchaResponse
+	// nonce 标识「本轮」验证码。验证码答错时上游会重新发起挑战，
+	// 服务会在同一端口重启；带上 nonce 才能区分新旧两轮，
+	// 避免旧标签页把过期坐标提交给新一轮。
+	nonce string
+}
+
+// startCaptchaServer 在 bind 指定的地址上启动验证码页面服务。
+//
+// bind 为空时沿用上游行为：只监听 127.0.0.1 的随机端口（容器内不可达）。
+// bind 形如 "0.0.0.0:18080" 时监听固定端口，配合容器端口映射即可让宿主机
+// 浏览器直接打开，无需 --network host。
+func startCaptchaServer(imgData []byte, bind string) (*captchaServer, error) {
+	if bind == "" {
+		bind = "127.0.0.1:0"
+	}
+
 	resultCh := make(chan ClickCaptchaResponse, 1)
+	nonce := newChallengeNonce()
 
 	mux := http.NewServeMux()
 
@@ -319,6 +363,10 @@ func serveCaptchaInBrowser(imgData []byte, timeout time.Duration, output io.Writ
 	mux.HandleFunc("/submit", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if r.FormValue("n") != nonce {
+			http.Error(w, "stale captcha page, please use the newly opened one", http.StatusConflict)
 			return
 		}
 		code := r.FormValue("code")
@@ -340,26 +388,68 @@ func serveCaptchaInBrowser(imgData []byte, timeout time.Duration, output io.Writ
 		}
 	})
 
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	listener, err := net.Listen("tcp", bind)
 	if err != nil {
-		return ClickCaptchaResponse{}, fmt.Errorf("failed to start captcha server: %w", err)
+		return nil, fmt.Errorf("failed to start captcha server on %q: %w", bind, err)
 	}
 
-	srv := &http.Server{Handler: mux}
+	cs := &captchaServer{
+		srv:      &http.Server{Handler: mux},
+		listener: listener,
+		resultCh: resultCh,
+		nonce:    nonce,
+	}
 
-	go srv.Serve(listener)
+	go cs.srv.Serve(listener)
 
-	addr := fmt.Sprintf("http://%s", listener.Addr().String())
-	_, _ = fmt.Fprintf(output, "Captcha server started at %s\n", addr)
+	return cs, nil
+}
 
-	openBrowser(addr, output)
+// URL 返回宿主可直接访问的地址。监听通配地址时改写为 127.0.0.1，
+// 因为容器外看到的就是宿主自己的回环。
+func (c *captchaServer) URL() string {
+	addr, ok := c.listener.Addr().(*net.TCPAddr)
+	if !ok {
+		return "http://" + c.listener.Addr().String()
+	}
+
+	host := addr.IP.String()
+	if addr.IP.IsUnspecified() {
+		host = "127.0.0.1"
+	}
+
+	// 带上 nonce：每轮 URL 都不同，浏览器才会新开标签页而不是复用旧页
+	return fmt.Sprintf("http://%s/?n=%s", net.JoinHostPort(host, strconv.Itoa(addr.Port)), c.nonce)
+}
+
+func (c *captchaServer) Close() {
+	_ = c.srv.Shutdown(context.Background())
+}
+
+// serveCaptchaInBrowser starts a temporary HTTP server to display the captcha
+// image in the user's browser and waits for the user to click on character
+// positions and submit the coordinates.
+func serveCaptchaInBrowser(imgData []byte, timeout time.Duration, output io.Writer) (ClickCaptchaResponse, error) {
+	return serveCaptchaInBrowserBind(imgData, timeout, output, "")
+}
+
+// serveCaptchaInBrowserBind 与 serveCaptchaInBrowser 相同，但可指定监听地址。
+func serveCaptchaInBrowserBind(imgData []byte, timeout time.Duration, output io.Writer, bind string) (ClickCaptchaResponse, error) {
+	cs, err := startCaptchaServer(imgData, bind)
+	if err != nil {
+		return ClickCaptchaResponse{}, err
+	}
+	defer cs.Close()
+
+	url := cs.URL()
+	_, _ = fmt.Fprintf(output, "Captcha server started at %s\n", url)
+
+	openBrowser(url, output)
 
 	select {
-	case response := <-resultCh:
-		srv.Shutdown(context.Background())
+	case response := <-cs.resultCh:
 		return response, nil
 	case <-time.After(timeout):
-		srv.Shutdown(context.Background())
 		return ClickCaptchaResponse{}, fmt.Errorf("captcha input timed out after %v", timeout)
 	}
 }

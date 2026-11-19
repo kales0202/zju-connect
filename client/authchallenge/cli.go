@@ -17,12 +17,17 @@ type CLIOptions struct {
 	Input          io.Reader
 	Output         io.Writer
 	CaptchaTimeout time.Duration
+	// CaptchaBind 是图形验证码 HTTP 服务的监听地址。
+	// 留空时只监听 127.0.0.1 随机端口（容器内不可达）；
+	// 设为 "0.0.0.0:18080" 之类可配合容器端口映射，让宿主机浏览器直接打开。
+	CaptchaBind string
 }
 
 type CLIHandler struct {
 	input          *bufio.Reader
 	output         io.Writer
 	captchaTimeout time.Duration
+	captchaBind    string
 	mu             sync.Mutex
 }
 
@@ -43,6 +48,7 @@ func NewCLIHandler(options CLIOptions) *CLIHandler {
 		input:          bufio.NewReader(input),
 		output:         output,
 		captchaTimeout: timeout,
+		captchaBind:    options.CaptchaBind,
 	}
 }
 
@@ -96,7 +102,7 @@ func (h *CLIHandler) HandleClickCaptcha(challenge ClickCaptchaChallenge) (ClickC
 	defer h.mu.Unlock()
 
 	if challenge.OutputPath == "" {
-		return serveCaptchaInBrowser(challenge.Image, h.captchaTimeout, h.output)
+		return serveCaptchaInBrowserBind(challenge.Image, h.captchaTimeout, h.output, h.captchaBind)
 	}
 	if err := os.WriteFile(challenge.OutputPath, challenge.Image, 0644); err != nil {
 		return ClickCaptchaResponse{}, fmt.Errorf("write captcha image: %w", err)

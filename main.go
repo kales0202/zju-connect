@@ -16,6 +16,7 @@ import (
 
 	"github.com/containers/winquit/pkg/winquit"
 	"github.com/mythologyli/zju-connect/client"
+	"github.com/mythologyli/zju-connect/client/authchallenge"
 	atrustclient "github.com/mythologyli/zju-connect/client/atrust"
 	"github.com/mythologyli/zju-connect/client/atrust/auth"
 	easyconnectclient "github.com/mythologyli/zju-connect/client/easyconnect"
@@ -185,6 +186,25 @@ func main() {
 			}
 		}
 
+		// 交互式挑战（图形验证码 / 短信验证码）的应答通路。
+		//
+		// 默认 CLIHandler 读 stdin，要求容器带 -it；后台运行的 compose 服务拿不到 stdin，
+		// 于是需要人工介入的登录必然失败。这里在配置了 challenge_dir 时改用文件桥：
+		// 程序把「需要什么」写成 state.json，用户把「答案」写回共享目录，
+		// 全程不依赖 tty，也就不必为此牺牲 bridge 网络的隔离。
+		var challengeHandler authchallenge.Handler
+		if conf.ChallengeDir != "" {
+			timeout := time.Duration(conf.ChallengeTimeout) * time.Second
+			challengeHandler = authchallenge.NewWebBridgeHandler(authchallenge.WebBridgeOptions{
+				Dir:            conf.ChallengeDir,
+				CaptchaBind:    conf.CaptchaBind,
+				CaptchaTimeout: timeout,
+				CodeTimeout:    timeout,
+				Output:         os.Stdout,
+			})
+			log.Printf("Challenge input via shared dir: %s", conf.ChallengeDir)
+		}
+
 		log.Printf("VPN protocol: %s", conf.Protocol)
 		clientData, err = vpnClient.(*atrustclient.Client).Setup(atrustclient.SetupOptions{
 			ServerAddress:            conf.ServerAddress,
@@ -195,6 +215,7 @@ func main() {
 			ResourceData:             resourceData,
 			BestNodesRefreshInterval: time.Duration(conf.UpdateBestNodesInterval) * time.Second,
 			SessionRefreshInterval:   time.Duration(conf.SessionRefreshInterval) * time.Second,
+			ChallengeHandler:         challengeHandler,
 			SaveClientData:           saveClientDataFunc,
 		})
 		if err != nil {

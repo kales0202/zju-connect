@@ -32,6 +32,9 @@ type Config struct {
 	ProxyAll            bool                   `koanf:"proxy_all"`
 	FakeIP              bool                   `koanf:"fake_ip"`
 	GraphCodeFile       string                 `koanf:"graph_code_file"`
+	CaptchaBind         string                 `koanf:"captcha_bind"`
+	ChallengeDir        string                 `koanf:"challenge_dir"`
+	ChallengeTimeout    int                    `koanf:"challenge_timeout"`
 	DebugDump           bool                   `koanf:"debug_dump"`
 	DebugPCAPFile       string                 `koanf:"debug_pcap_file"`
 	DebugTLSLogFile     string                 `koanf:"debug_tls_log_file"`
