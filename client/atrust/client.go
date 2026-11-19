@@ -330,6 +330,22 @@ func (c *Client) Setup(options SetupOptions) ([]byte, error) {
 	return c.SetupContext(context.Background(), options)
 }
 
+// newSessionContext 创建会话用的上下文。
+//
+// 会话必须在 Setup 返回后继续存活：会话刷新（startSessionRefresh）会一直用到
+// 进程结束。所以父上下文取客户端生命周期，而不是 SetupContext 里的 setupCtx
+// ——setupCtx 在 SetupContext 返回时就会被 defer cancelSetup() 取消。
+// 用 setupCtx 的后果是所有刷新请求在发出前就收到 context canceled，
+// 会话因此永远不会被维护。
+//
+// 同时保留 setup 阶段的联动：调用方取消时，进行中的登录请求应当中止。
+// 返回的 detach 在 setup 结束时调用，解除这层联动（成功与否都要调用）。
+func (c *Client) newSessionContext(setupCtx context.Context) (context.Context, func()) {
+	sessCtx, sessCancel := context.WithCancel(c.lifecycleCtx)
+	stopSetupAbort := context.AfterFunc(setupCtx, sessCancel)
+	return sessCtx, func() { stopSetupAbort() }
+}
+
 func (c *Client) SetupContext(ctx context.Context, options SetupOptions) ([]byte, error) {
 	setupCtx, cancelSetup := context.WithCancel(ctx)
 	defer cancelSetup()
@@ -364,7 +380,9 @@ func (c *Client) SetupContext(ctx context.Context, options SetupOptions) ([]byte
 	} else {
 		authServerHost = fmt.Sprintf("%s:%d", options.ServerAddress, options.ServerPort)
 	}
-	sess := auth.NewSessionContext(setupCtx, authServerHost, c.tlsKeyLogWriter, c.underlayDialer.DialContext)
+	sessCtx, detachSessionCtx := c.newSessionContext(setupCtx)
+	defer detachSessionCtx()
+	sess := auth.NewSessionContext(sessCtx, authServerHost, c.tlsKeyLogWriter, c.underlayDialer.DialContext)
 	serverVersionInfo, manifestErr := sess.ServerVersionInfo()
 	serverVersionInfo, err := resolveServerVersionInfo(clientAuthData.ServerVersionInfo, serverVersionInfo, manifestErr)
 	if err != nil {
